@@ -88,8 +88,6 @@ class Provider:
             kind of features are returned.
 
         Sample configuration, for a layer with no results at zooms 0-9, basic
-        selection of lines with names and highway tags for zoom 10, a remote
-        URL containing a query for zoom 11, and a local file for zooms 12+:
         
           "provider":
           {
@@ -103,18 +101,21 @@ class Provider:
                 "password": "gis",
                 "database": "gis"
               },
-              "queries":
+              "table": "road_network",
+              "geometries":
               [
                 null, null, null, null, null,
                 null, null, null, null, null,
-                "SELECT way AS __geometry__, highway, name FROM planet_osm_line -- zoom 10+ ",
-                "http://example.com/query-z11.pgsql",
-                "query-z12-plus.pgsql"
-              ]
+                "way",
+                "way",
+                "way"
+              ],
+              "attributes": 
+              [ "trim(name) as name", "length" ]
             }
           }
     '''
-    def __init__(self, layer, dbinfo, queries, clip=True, srid=900913, simplify=1.0, simplify_until=16, suppress_simplification=(), geometry_types=None):
+    def __init__(self, layer, dbinfo, table, geometries, attributes=[], clip=True, srid=900913, simplify=1.0, simplify_until=16, suppress_simplification=(), geometry_types=None):
         '''
         '''
         self.layer = layer
@@ -129,52 +130,49 @@ class Provider:
         self.suppress_simplification = set(suppress_simplification)
         self.geometry_types = None if geometry_types is None else set(geometry_types)
 
-        self.queries = []
+        self.table = table
+        self.geometries = []
+        self.attributes = {}
         self.columns = {}
         
-        for query in queries:
+        for i,query in enumerate(geometries):
             if query is None:
-                self.queries.append(None)
+                self.geometries.append(None)
                 continue
-        
-            #
-            # might be a file or URL?
-            #
-            url = urljoin(layer.config.dirpath, query)
-            scheme, h, path, p, q, f = urlparse(url)
-            
-            if scheme in ('file', '') and exists(path):
-                query = open(path).read()
-            
-            elif scheme == 'http' and ' ' not in url:
-                query = urlopen(url).read()
-        
-            self.queries.append(query)
+            self.geometries.append(query)
+            if attributes:
+              if len(attributes) > 1:
+                self.attributes[query] = attributes[i]
+              else:
+                self.attributes[query] = attributes[0]
         
     def renderTile(self, width, height, srs, coord):
         ''' Render a single tile, return a Response instance.
         '''
         try:
-            query = self.queries[coord.zoom]
+            geometry = self.geometries[coord.zoom]
         except IndexError:
-            query = self.queries[-1]
-
-        ll = self.layer.projection.coordinateProj(coord.down())
-        ur = self.layer.projection.coordinateProj(coord.right())
-        bounds = ll.x, ll.y, ur.x, ur.y
-        
-        if not query:
+            geometry = self.geometries[-1]
+        if not geometry:
             return EmptyResponse(bounds)
-        
-        if query not in self.columns:
-            self.columns[query] = query_columns(self.dbinfo, self.srid, query, bounds)
-        
+
+        attributes = self.attributes.get(geometry, [])
+
         if coord.zoom in self.suppress_simplification:
             tolerance = None
         else:
             tolerance = self.simplify * tolerances[coord.zoom] if coord.zoom < self.simplify_until else None
 
-        return Response(self.dbinfo, self.srid, query, self.columns[query], bounds, tolerance, coord.zoom, self.clip, coord, self.layer.name(), self.geometry_types)
+        ll = self.layer.projection.coordinateProj(coord.down())
+        ur = self.layer.projection.coordinateProj(coord.right())
+        bounds = ll.x, ll.y, ur.x, ur.y
+        
+        if geometry not in self.columns:
+            self.columns[geometry] = query_columns(self.dbinfo, self.srid, self.table, geometry, attributes, bounds)
+        columns = self.columns[geometry]
+        
+
+        return Response(self.dbinfo, self.srid, self.table, geometry, attributes, columns, bounds, tolerance, coord.zoom, self.clip, coord, self.layer.name(), self.geometry_types)
 
     def getTypeByExtension(self, extension):
         ''' Get mime-type and format by file extension, one of "mvt", "json" or "topojson".
@@ -269,12 +267,14 @@ class Connection:
 class Response:
     '''
     '''
-    def __init__(self, dbinfo, srid, subquery, columns, bounds, tolerance, zoom, clip, coord, layer_name, geometry_types):
+    def __init__(self, dbinfo, srid, table, geometry, attributes, columns, bounds, tolerance, zoom, clip, coord, layer_name, geometry_types):
         ''' Create a new response object with Postgres connection info and a query.
         
             bounds argument is a 4-tuple with (xmin, ymin, xmax, ymax).
         '''
         self.dbinfo = dbinfo
+        self.table = table
+        self.geometry = geometry
         self.bounds = bounds
         self.zoom = zoom
         self.clip = clip
@@ -282,10 +282,10 @@ class Response:
         self.layer_name = layer_name
         self.geometry_types = geometry_types
         
-        geo_query = build_query(srid, subquery, columns, bounds, tolerance, True, clip)
-        merc_query = build_query(srid, subquery, columns, bounds, tolerance, False, clip)
-        oscimap_query = build_query(srid, subquery, columns, bounds, tolerance, False, clip, oscimap.padding * tolerances[coord.zoom], oscimap.extents)
-        mapbox_query = build_query(srid, subquery, columns, bounds, tolerance, False, clip, mapbox.padding * tolerances[coord.zoom], mapbox.extents)
+        geo_query = build_query(srid, table, geometry, attributes, columns, bounds, tolerance, True, clip)
+        merc_query = build_query(srid, table, geometry, attributes, columns, bounds, tolerance, False, clip)
+        oscimap_query = build_query(srid, table, geometry, attributes, columns, bounds, tolerance, False, clip, oscimap.padding * tolerances[coord.zoom], oscimap.extents)
+        mapbox_query = build_query(srid, table, geometry, attributes, columns, bounds, tolerance, False, clip, mapbox.padding * tolerances[coord.zoom], mapbox.extents)
         self.query = dict(TopoJSON=geo_query, JSON=geo_query, MVT=merc_query, OpenScienceMap=oscimap_query, Mapbox=mapbox_query)
 
     def save(self, out, format):
@@ -407,14 +407,16 @@ class MultiResponse:
         return tiles
 
 
-def query_columns(dbinfo, srid, subquery, bounds):
-    ''' Get information about the columns returned for a subquery.
+def query_columns(dbinfo, srid, table, geometry, attributes, bounds):
+    ''' Get information about the columns returned for a given geometry and attribute query.
     '''
     with Connection(dbinfo) as db:
         bbox = 'ST_MakeBox2D(ST_MakePoint(%f, %f), ST_MakePoint(%f, %f))' % bounds
         bbox = 'ST_SetSRID(%s, %d)' % (bbox, srid)
 
-        query = subquery.replace('!bbox!', bbox)
+        columns = ', '.join([geometry + ' AS __geometry__'] + attributes)
+        query = "SELECT %s FROM %s" % (columns, table)
+        query = query.replace('!bbox!', bbox)
 
         # newline is important here, to break out of comments.
         db.execute(query + '\n LIMIT 0')
@@ -453,45 +455,43 @@ def get_features(dbinfo, query, geometry_types, n_try=1):
 
     return features
 
-def build_query(srid, subquery, subcolumns, bounds, tolerance, is_geo, is_clipped, padding=0, scale=None):
+def build_query(srid, table, geometry, attributes, columns, bounds, tolerance, is_geo, is_clipped, padding=0, scale=None):
     ''' Build and return an PostGIS query.
     '''
     bbox = 'ST_MakeBox2D(ST_MakePoint(%.12f, %.12f), ST_MakePoint(%.12f, %.12f))' % (bounds[0] - padding, bounds[1] - padding, bounds[2] + padding, bounds[3] + padding)
     bbox = 'ST_SetSRID(%s, %d)' % (bbox, srid)
-    geom = 'q.__geometry__'
+
+    geom = geometry 
     
-    if is_clipped:
-        geom = 'ST_Intersection(%s, %s)' % (geom, bbox)
-    
+    # the order of the next two operations may have a performance impact
+    # this order preserves clean tile borders, that cannot be distorted from simplification 
     if tolerance is not None:
         geom = 'ST_SimplifyPreserveTopology(%s, %.12f)' % (geom, tolerance)
+
+    if is_clipped:
+        geom = 'ST_Intersection(%s, %s)' % (geom, bbox)
     
     if is_geo:
         geom = 'ST_Transform(%s, 4326)' % geom
 
     if scale:
-        # scale applies to the un-padded bounds, e.g. geometry in the padding area "spills over" past the scale range
-        geom = ('ST_TransScale(%s, %.12f, %.12f, %.12f, %.12f)'
+      # scale applies to the un-padded bounds, e.g. geometry in the padding area "spills over" past the scale range
+      geom = ('ST_TransScale(%s, %.12f, %.12f, %.12f, %.12f)'
                 % (geom, -bounds[0], -bounds[1],
                    scale / (bounds[2] - bounds[0]),
                    scale / (bounds[3] - bounds[1])))
 
-    subquery = subquery.replace('!bbox!', bbox)
-    columns = ['q."%s"' % c for c in subcolumns if c not in ('__geometry__', )]
+    if '__geometry__' not in columns:
+        raise Exception("There's supposed to be a __geometry__ column. We got %s" % ",".join(columns))
+
+    if '__id__' not in columns:
+        attributes.append('Substr(MD5(ST_AsBinary(%s)), 1, 10) AS __id__' % geometry)
+        columns.add("__id__")
+
+    attributes = ', '.join(attributes)
     
-    if '__geometry__' not in subcolumns:
-        raise Exception("There's supposed to be a __geometry__ column.")
-    
-    if '__id__' not in subcolumns:
-        columns.append('Substr(MD5(ST_AsBinary(q.__geometry__)), 1, 10) AS __id__')
-    
-    columns = ', '.join(columns)
-    
-    return '''SELECT %(columns)s,
+    return '''SELECT %(attributes)s,
                      ST_AsBinary(%(geom)s) AS __geometry__
-              FROM (
-                %(subquery)s
-                ) AS q
-              WHERE ST_IsValid(q.__geometry__)
-                AND ST_Intersects(q.__geometry__, %(bbox)s)''' \
+              FROM %(table)s 
+              WHERE %(geometry)s && %(bbox)s''' \
             % locals()
